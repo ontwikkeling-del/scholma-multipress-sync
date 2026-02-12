@@ -2,16 +2,17 @@
 Scholma MultiPress → HubSpot Deal Status Sync - Web Service
 
 Endpoints:
-    GET  /health     - Health check
-    GET  /sync       - Run sync (all active stages)
+    GET  /health      - Health check + last sync result
+    GET  /sync        - Run sync (all active stages, background)
     GET  /sync?stage=voorstel  - Only check 'Voorstel verstuurd' stage
 """
 import os
 import re
 import time
+import threading
 import requests
 import urllib3
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from fastapi import FastAPI, Query, Header, HTTPException
 
@@ -43,6 +44,10 @@ STAGE_VERLOREN = "3594129640"
 # MultiPress status mapping
 STATUS_WON = {"Order"}
 STATUS_LOST = {"Order ao", "Vervallen", "Niet gegund", "Te duur >10%"}
+
+# Last sync result (in-memory)
+_last_sync = {"status": "never_run"}
+_sync_lock = threading.Lock()
 
 
 def hs_headers():
@@ -143,7 +148,7 @@ def find_opvolgen_tasks(qn_set: set[str]) -> dict[str, list[str]]:
             break
         time.sleep(0.1)
 
-    # Map qn → [task_ids]
+    # Map qn -> [task_ids]
     result = {}
     for task in all_tasks:
         subject = task["properties"].get("hs_task_subject", "")
@@ -154,9 +159,99 @@ def find_opvolgen_tasks(qn_set: set[str]) -> dict[str, list[str]]:
     return result
 
 
+def _run_sync(stage_ids: list[str], stage_label: str):
+    """Run the sync in background thread."""
+    global _last_sync
+    started = datetime.utcnow().isoformat()
+
+    try:
+        # Step 1: Get deals
+        deals = get_deals_by_stage(stage_ids)
+
+        # Step 2: Check MultiPress (parallel, 5 workers)
+        won, lost = [], []
+        skip = errors = no_qn = 0
+
+        work = []
+        for deal in deals:
+            qn = extract_qn(deal)
+            if not qn:
+                no_qn += 1
+                continue
+            work.append((deal, qn))
+
+        def _check(item):
+            deal, qn = item
+            mp_status, company = check_mp_status(qn)
+            return deal, qn, mp_status, company
+
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            for deal, qn, mp_status, company in pool.map(_check, work):
+                if mp_status is None:
+                    errors += 1
+                elif mp_status in STATUS_WON:
+                    won.append({"deal_id": deal["id"], "qn": qn, "company": company, "from_stage": deal.get("_stage", "?")})
+                elif mp_status in STATUS_LOST:
+                    lost.append({"deal_id": deal["id"], "qn": qn, "company": company, "status": mp_status, "from_stage": deal.get("_stage", "?")})
+                else:
+                    skip += 1
+
+        # Step 3: Update deals
+        updated_won = 0
+        for item in won:
+            r = requests.patch(
+                f'{HS_BASE}/crm/v3/objects/deals/{item["deal_id"]}',
+                headers=hs_headers(),
+                json={"properties": {"dealstage": STAGE_GEWONNEN}},
+            )
+            if r.status_code == 200:
+                updated_won += 1
+            time.sleep(0.1)
+
+        updated_lost = 0
+        for item in lost:
+            r = requests.patch(
+                f'{HS_BASE}/crm/v3/objects/deals/{item["deal_id"]}',
+                headers=hs_headers(),
+                json={"properties": {"dealstage": STAGE_VERLOREN}},
+            )
+            if r.status_code == 200:
+                updated_lost += 1
+            time.sleep(0.1)
+
+        # Step 4: Delete tasks
+        all_updated_qns = set(d["qn"] for d in won + lost)
+        tasks_map = find_opvolgen_tasks(all_updated_qns) if all_updated_qns else {}
+        tasks_deleted = 0
+        for qn in all_updated_qns:
+            tasks_deleted += delete_task_for_qn(qn, tasks_map)
+
+        result = {
+            "status": "completed",
+            "stage": stage_label,
+            "started": started,
+            "finished": datetime.utcnow().isoformat(),
+            "deals_checked": len(deals),
+            "no_quotation_number": no_qn,
+            "api_errors": errors,
+            "unchanged": skip,
+            "won": updated_won,
+            "lost": updated_lost,
+            "tasks_deleted": tasks_deleted,
+            "won_details": [{"qn": d["qn"], "company": d["company"], "from": d["from_stage"]} for d in won],
+            "lost_details": [{"qn": d["qn"], "company": d["company"], "status": d["status"], "from": d["from_stage"]} for d in lost],
+        }
+    except Exception as e:
+        result = {"status": "error", "stage": stage_label, "started": started, "error": str(e)}
+
+    with _sync_lock:
+        _last_sync.update(result)
+
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "scholma-deal-sync"}
+    with _sync_lock:
+        return {"status": "ok", "service": "scholma-deal-sync", "last_sync": _last_sync}
 
 
 @app.get("/sync")
@@ -171,90 +266,22 @@ def sync(
     if not HUBSPOT_API_KEY or not MULTIPRESS_PASS:
         raise HTTPException(status_code=500, detail="Missing environment variables")
 
-    started = datetime.utcnow().isoformat()
-
     # Determine which stages to check
     if stage == "voorstel":
         stage_ids = ["3594129636"]
+        stage_label = "voorstel"
     else:
         stage_ids = list(STAGES.keys())
+        stage_label = "all"
 
-    # Step 1: Get deals
-    deals = get_deals_by_stage(stage_ids)
+    # Check if already running
+    with _sync_lock:
+        if _last_sync.get("status") == "running":
+            return {"status": "already_running", "started": _last_sync.get("started")}
+        _last_sync.update({"status": "running", "stage": stage_label, "started": datetime.utcnow().isoformat()})
 
-    # Step 2: Check MultiPress (parallel)
-    won = []
-    lost = []
-    skip = 0
-    errors = 0
-    no_qn = 0
+    # Run in background thread
+    thread = threading.Thread(target=_run_sync, args=(stage_ids, stage_label), daemon=True)
+    thread.start()
 
-    # Build work items
-    work = []
-    for deal in deals:
-        qn = extract_qn(deal)
-        if not qn:
-            no_qn += 1
-            continue
-        work.append((deal, qn))
-
-    # Run MP checks in parallel (5 workers to not overwhelm MultiPress)
-    def _check(item):
-        deal, qn = item
-        mp_status, company = check_mp_status(qn)
-        return deal, qn, mp_status, company
-
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        for deal, qn, mp_status, company in pool.map(_check, work):
-            if mp_status is None:
-                errors += 1
-            elif mp_status in STATUS_WON:
-                won.append({"deal_id": deal["id"], "qn": qn, "company": company, "from_stage": deal.get("_stage", "?")})
-            elif mp_status in STATUS_LOST:
-                lost.append({"deal_id": deal["id"], "qn": qn, "company": company, "status": mp_status, "from_stage": deal.get("_stage", "?")})
-            else:
-                skip += 1
-
-    # Step 3: Update deals
-    updated_won = 0
-    for item in won:
-        r = requests.patch(
-            f'{HS_BASE}/crm/v3/objects/deals/{item["deal_id"]}',
-            headers=hs_headers(),
-            json={"properties": {"dealstage": STAGE_GEWONNEN}},
-        )
-        if r.status_code == 200:
-            updated_won += 1
-        time.sleep(0.1)
-
-    updated_lost = 0
-    for item in lost:
-        r = requests.patch(
-            f'{HS_BASE}/crm/v3/objects/deals/{item["deal_id"]}',
-            headers=hs_headers(),
-            json={"properties": {"dealstage": STAGE_VERLOREN}},
-        )
-        if r.status_code == 200:
-            updated_lost += 1
-        time.sleep(0.1)
-
-    # Step 4: Delete tasks
-    all_updated_qns = set(d["qn"] for d in won + lost)
-    tasks_map = find_opvolgen_tasks(all_updated_qns) if all_updated_qns else {}
-    tasks_deleted = 0
-    for qn in all_updated_qns:
-        tasks_deleted += delete_task_for_qn(qn, tasks_map)
-
-    return {
-        "started": started,
-        "finished": datetime.utcnow().isoformat(),
-        "deals_checked": len(deals),
-        "no_quotation_number": no_qn,
-        "api_errors": errors,
-        "unchanged": skip,
-        "won": updated_won,
-        "lost": updated_lost,
-        "tasks_deleted": tasks_deleted,
-        "won_details": [{"qn": d["qn"], "company": d["company"], "from": d["from_stage"]} for d in won],
-        "lost_details": [{"qn": d["qn"], "company": d["company"], "status": d["status"], "from": d["from_stage"]} for d in lost],
-    }
+    return {"status": "started", "stage": stage_label, "message": "Sync started. Check /health for results."}
