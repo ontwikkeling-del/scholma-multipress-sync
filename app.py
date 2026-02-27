@@ -161,6 +161,59 @@ def find_opvolgen_tasks(qn_set: set[str]) -> dict[str, list[str]]:
     return result
 
 
+def cleanup_final_deal_tasks(days_back: int = 14) -> int:
+    """Delete Opvolgen tasks for deals already in Gewonnen/Verloren stage (safety net).
+
+    Catches tasks that were created after a deal was moved to its final stage,
+    which the regular sync misses because it only queries active stages.
+    """
+    from datetime import timezone
+    cutoff_ms = int(
+        (datetime.utcnow() - timedelta(days=days_back))
+        .replace(tzinfo=timezone.utc)
+        .timestamp()
+        * 1000
+    )
+
+    qns = set()
+    for stage_id in [STAGE_GEWONNEN, STAGE_VERLOREN]:
+        after = None
+        while True:
+            payload = {
+                "filterGroups": [{
+                    "filters": [
+                        {"propertyName": "dealstage", "operator": "EQ", "value": stage_id},
+                        {"propertyName": "hs_lastmodifieddate", "operator": "GTE", "value": str(cutoff_ms)},
+                    ]
+                }],
+                "properties": ["dealname", "client_system_deal_id", "offerte_id"],
+                "limit": 100,
+            }
+            if after:
+                payload["after"] = after
+            r = requests.post(f"{HS_BASE}/crm/v3/objects/deals/search", headers=hs_headers(), json=payload)
+            if r.status_code != 200:
+                break
+            data = r.json()
+            for deal in data.get("results", []):
+                qn = extract_qn(deal)
+                if qn:
+                    qns.add(qn)
+            after = data.get("paging", {}).get("next", {}).get("after")
+            if not after:
+                break
+            time.sleep(0.1)
+
+    if not qns:
+        return 0
+
+    tasks_map = find_opvolgen_tasks(qns)
+    deleted = 0
+    for qn in qns:
+        deleted += delete_task_for_qn(qn, tasks_map)
+    return deleted
+
+
 def _run_sync(stage_ids: list[str], stage_label: str):
     """Run the sync in background thread."""
     global _last_sync
@@ -221,12 +274,16 @@ def _run_sync(stage_ids: list[str], stage_label: str):
                 updated_lost += 1
             time.sleep(0.1)
 
-        # Step 4: Delete tasks
+        # Step 4: Delete tasks for deals moved in this run
         all_updated_qns = set(d["qn"] for d in won + lost)
         tasks_map = find_opvolgen_tasks(all_updated_qns) if all_updated_qns else {}
         tasks_deleted = 0
         for qn in all_updated_qns:
             tasks_deleted += delete_task_for_qn(qn, tasks_map)
+
+        # Step 5: Safety cleanup - remove Opvolgen tasks for already-final deals
+        # (catches tasks created after deal was moved, which the main sync misses)
+        cleanup_deleted = cleanup_final_deal_tasks(days_back=14)
 
         result = {
             "status": "completed",
@@ -240,6 +297,7 @@ def _run_sync(stage_ids: list[str], stage_label: str):
             "won": updated_won,
             "lost": updated_lost,
             "tasks_deleted": tasks_deleted,
+            "tasks_cleanup_deleted": cleanup_deleted,
             "won_details": [{"qn": d["qn"], "company": d["company"], "from": d["from_stage"]} for d in won],
             "lost_details": [{"qn": d["qn"], "company": d["company"], "status": d["status"], "from": d["from_stage"]} for d in lost],
         }
